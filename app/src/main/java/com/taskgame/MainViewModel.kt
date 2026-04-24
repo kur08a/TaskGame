@@ -105,6 +105,12 @@ class MainViewModel(private val repository: TaskGameRepository) : ViewModel() {
             message.value = result.exceptionOrNull()?.message ?: "任务复活成功"
         }
     }
+
+    fun refreshTimeSensitiveState() {
+        viewModelScope.launch {
+            repository.refreshOverdueAndScore()
+        }
+    }
 }
 
 class MainViewModelFactory(private val repository: TaskGameRepository) : ViewModelProvider.Factory {

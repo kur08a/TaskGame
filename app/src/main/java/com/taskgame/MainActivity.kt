@@ -1,10 +1,17 @@
 package com.taskgame
 
 import android.app.Activity
+import android.app.AlarmManager
 import android.app.DatePickerDialog
+import android.content.Context
+import android.content.Intent
+import android.content.SharedPreferences
+import android.content.pm.PackageManager
 import android.os.Bundle
+import android.provider.Settings
 import android.widget.NumberPicker
 import android.app.TimePickerDialog
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.viewModels
@@ -18,6 +25,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.border
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
@@ -42,15 +50,18 @@ import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
@@ -64,6 +75,7 @@ import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
 import androidx.navigation.navArgument
+import androidx.core.content.edit
 import com.taskgame.data.TaskDifficulty
 import com.taskgame.data.TaskGameRepository
 import com.taskgame.data.TaskStatus
@@ -71,15 +83,30 @@ import com.taskgame.data.TaskUiModel
 import com.taskgame.data.currentMinuteMillis
 import com.taskgame.data.formatDateTime
 import java.util.Calendar
+import java.util.Locale
+import androidx.core.net.toUri
 import kotlinx.coroutines.delay
 
 class MainActivity : ComponentActivity() {
     private val vm: MainViewModel by viewModels {
         MainViewModelFactory(TaskGameRepository.getInstance(applicationContext))
     }
+    private val notificationPermissionLauncher =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+            if (!granted && android.os.Build.VERSION.SDK_INT >= 33) {
+                val intent = Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).apply {
+                    putExtra(Settings.EXTRA_APP_PACKAGE, packageName)
+                }
+                runCatching { startActivity(intent) }
+            }
+        }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        TaskNotificationScheduler.ensureWorkerScheduled(applicationContext)
+        TaskNotificationScheduler.triggerImmediateCheck(applicationContext)
+        requestNotificationPermissionIfNeeded()
+        requestExactAlarmPermissionIfNeeded()
         setContent {
             val dashboard by vm.dashboard.collectAsStateWithLifecycle()
             val nav = rememberNavController()
@@ -142,6 +169,28 @@ class MainActivity : ComponentActivity() {
             }
         }
     }
+
+    private fun requestNotificationPermissionIfNeeded() {
+        if (android.os.Build.VERSION.SDK_INT >= 33) {
+            val granted = checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
+            if (!granted) {
+                notificationPermissionLauncher.launch(android.Manifest.permission.POST_NOTIFICATIONS)
+            }
+        }
+    }
+
+    private fun requestExactAlarmPermissionIfNeeded() {
+        if (android.os.Build.VERSION.SDK_INT >= 31) {
+            val alarmManager = getSystemService(ALARM_SERVICE) as AlarmManager
+            if (!alarmManager.canScheduleExactAlarms()) {
+                val intent = Intent(Settings.ACTION_REQUEST_SCHEDULE_EXACT_ALARM).apply {
+                    data = "package:$packageName".toUri()
+                }
+                runCatching { startActivity(intent) }
+            }
+        }
+    }
+
 }
 
 @Composable
@@ -210,6 +259,7 @@ private fun HomeScreen(
     onProfile: () -> Unit,
     onRevive: (Long) -> Unit
 ) {
+    val context = LocalContext.current
     val dashboard by vm.dashboard.collectAsStateWithLifecycle()
     val message by vm.message.collectAsStateWithLifecycle()
     var tab by remember { mutableStateOf(TaskStatus.Pending) }
@@ -218,6 +268,32 @@ private fun HomeScreen(
     var deletePwd by remember { mutableStateOf("") }
     var firstPromptDialog by remember { mutableStateOf(false) }
     var pageTip by remember { mutableStateOf<String?>(null) }
+    var backgroundPopupPromptDialog by remember { mutableStateOf(false) }
+    val closeDeleteDialog = {
+        if (deleteTarget != null) {
+            deleteTarget = null
+        }
+    }
+    val closeFirstPromptDialog = {
+        if (firstPromptDialog) {
+            firstPromptDialog = false
+        }
+    }
+    val nowMillis by produceState(initialValue = System.currentTimeMillis()) {
+        while (true) {
+            value = System.currentTimeMillis()
+            vm.refreshTimeSensitiveState()
+            delay(30_000)
+        }
+    }
+    val imminentTaskIds = dashboard.tasks
+        .filter {
+            (it.task.status == TaskStatus.Pending || it.task.status == TaskStatus.InProgress) &&
+                it.task.deadlineMillis > nowMillis &&
+                it.task.deadlineMillis - nowMillis < 30 * 60 * 1000L
+        }
+        .map { it.task.id }
+        .toSet()
 
     LaunchedEffect(message) {
         if (!message.isNullOrBlank()) {
@@ -235,6 +311,11 @@ private fun HomeScreen(
     LaunchedEffect(dashboard.settings.passwordInitialized, dashboard.settings.securityPromptDone) {
         if (!dashboard.settings.passwordInitialized && !dashboard.settings.securityPromptDone) {
             firstPromptDialog = true
+        }
+    }
+    LaunchedEffect(Unit) {
+        if (shouldShowBackgroundPopupPrompt(context)) {
+            backgroundPopupPromptDialog = true
         }
     }
 
@@ -261,6 +342,19 @@ private fun HomeScreen(
     ) { padding ->
         val currentTasks = dashboard.tasks.filter { it.task.status == tab }
         Column(modifier = Modifier.padding(padding).fillMaxSize()) {
+            if (imminentTaskIds.isNotEmpty()) {
+                Card(
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 6.dp),
+                    colors = CardDefaults.cardColors(containerColor = Color(0xFFFFF0F0))
+                ) {
+                    Text(
+                        "你有 ${imminentTaskIds.size} 个任务即将逾期，请尽快处理",
+                        modifier = Modifier.padding(10.dp),
+                        color = Color(0xFFB00020),
+                        fontWeight = FontWeight.Medium
+                    )
+                }
+            }
             Row(modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 6.dp)) {
                 listOf(TaskStatus.Pending, TaskStatus.InProgress, TaskStatus.Completed, TaskStatus.Overdue).forEach { status ->
                     val count = dashboard.tasks.count { it.task.status == status }
@@ -300,7 +394,8 @@ private fun HomeScreen(
                             onComplete = { vm.completeTask(model.task.id) },
                             onDelete = { deleteTarget = model.task.id },
                             onRevive = { onRevive(model.task.id) },
-                            onSubTaskDone = vm::completeSubTask
+                            onSubTaskDone = vm::completeSubTask,
+                            imminent = imminentTaskIds.contains(model.task.id)
                         )
                     }
                 }
@@ -316,17 +411,17 @@ private fun HomeScreen(
             }
         } else {
             AlertDialog(
-                onDismissRequest = { deleteTarget = null },
+                onDismissRequest = closeDeleteDialog,
                 confirmButton = {
                     Button(onClick = {
                         vm.verifyPassword(deletePwd) { ok ->
                             if (ok) vm.deleteTask(deleteTarget!!) else vm.message.value = "密码错误，请重新输入"
-                            deleteTarget = null
+                            closeDeleteDialog()
                             deletePwd = ""
                         }
                     }) { Text("删除") }
                 },
-                dismissButton = { TextButton(onClick = { deleteTarget = null }) { Text("取消") } },
+                dismissButton = { TextButton(onClick = closeDeleteDialog) { Text("取消") } },
                 title = { Text("删除任务") },
                 text = {
                     OutlinedTextField(
@@ -346,14 +441,14 @@ private fun HomeScreen(
             confirmButton = {
                 Button(onClick = {
                     vm.setSecurityPromptDone(true)
-                    firstPromptDialog = false
+                    closeFirstPromptDialog()
                     vm.message.value = "请在个人中心设置解锁密码并开启加密"
                 }) { Text("是") }
             },
             dismissButton = {
                 TextButton(onClick = {
                     vm.setSecurityPromptDone(true)
-                    firstPromptDialog = false
+                    closeFirstPromptDialog()
                 }) { Text("否") }
             },
             title = { Text("是否开启本地加密解锁") },
@@ -369,6 +464,28 @@ private fun HomeScreen(
             text = { Text("请稍候...") }
         )
     }
+
+    if (backgroundPopupPromptDialog) {
+        AlertDialog(
+            onDismissRequest = {},
+            confirmButton = {
+                Button(onClick = {
+                    markBackgroundPopupPromptShown(context)
+                    backgroundPopupPromptDialog = false
+                    openBackgroundPopupSettings(context)
+                }) { Text("去设置") }
+            },
+            dismissButton = {
+                TextButton(onClick = {
+                    markBackgroundPopupPromptShown(context)
+                    backgroundPopupPromptDialog = false
+                }) { Text("稍后") }
+            },
+            title = { Text("建议开启以下权限，方便接收任务逾期提醒") },
+            text = { Text("1. 建议在 应用详情 中允许 TaskGame 的“后台弹出界面”权限并开启“铃声”和“震动”。\n2. 建议在“设置->应用->自启动、关联启动”中开启 TaskGame。") }
+        )
+    }
+
 }
 
 @Composable
@@ -380,7 +497,8 @@ private fun TaskCard(
     onComplete: () -> Unit,
     onDelete: () -> Unit,
     onRevive: () -> Unit,
-    onSubTaskDone: (Long) -> Unit
+    onSubTaskDone: (Long) -> Unit,
+    imminent: Boolean
 ) {
     val bg = when (model.task.status) {
         TaskStatus.Pending -> Color(0xFFEDEDED)
@@ -389,7 +507,17 @@ private fun TaskCard(
         TaskStatus.Overdue -> Color(0xFFFFEBEB)
     }
     Card(
-        modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 6.dp).clickable { onToggle() },
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 12.dp, vertical = 6.dp)
+            .then(
+                if (imminent) {
+                    Modifier.border(width = 1.5.dp, color = Color(0xFFE53935), shape = RoundedCornerShape(12.dp))
+                } else {
+                    Modifier
+                }
+            )
+            .clickable { onToggle() },
         colors = CardDefaults.cardColors(containerColor = bg)
     ) {
         Column(Modifier.padding(12.dp)) {
@@ -418,7 +546,7 @@ private fun TaskCard(
                     }
                 }
                 model.completionPercent?.let {
-                    Text("总任务完成百分比：${String.format("%.2f", it)}%")
+                    Text("总任务完成百分比：${String.format(Locale.getDefault(), "%.2f", it)}%")
                 }
                 Spacer(modifier = Modifier.height(8.dp))
                 Row {
@@ -444,7 +572,7 @@ private fun CreateTaskScreen(
     var name by remember { mutableStateOf("") }
     var difficulty by remember { mutableStateOf(TaskDifficulty.Low) }
     var deadline by remember { mutableLongStateOf(currentMinuteMillis() + 24 * 60 * 60 * 1000L) }
-    var priority by remember { mutableStateOf(1) }
+    var priority by remember { mutableIntStateOf(1) }
     var description by remember { mutableStateOf("") }
     val subTasks = remember { mutableStateListOf<String>() }
     var subTaskInput by remember { mutableStateOf("") }
@@ -558,7 +686,11 @@ private fun CreateTaskScreen(
 }
 
 @Composable
-private fun ProfileScreen(vm: MainViewModel, activity: Activity, onBack: () -> Unit) {
+private fun ProfileScreen(
+    vm: MainViewModel,
+    activity: Activity,
+    onBack: () -> Unit
+) {
     val dashboard by vm.dashboard.collectAsStateWithLifecycle()
     val message by vm.message.collectAsStateWithLifecycle()
     var username by remember { mutableStateOf(dashboard.settings.username) }
@@ -570,6 +702,16 @@ private fun ProfileScreen(vm: MainViewModel, activity: Activity, onBack: () -> U
     var initPwd1 by remember { mutableStateOf("") }
     var initPwd2 by remember { mutableStateOf("") }
     var pageTip by remember { mutableStateOf<String?>(null) }
+    val closeInitDialog = {
+        if (initDialog) {
+            initDialog = false
+        }
+    }
+    val closePwdDialog = {
+        if (pwdDialog) {
+            pwdDialog = false
+        }
+    }
 
     LaunchedEffect(message) {
         if (!message.isNullOrBlank()) {
@@ -627,7 +769,7 @@ private fun ProfileScreen(vm: MainViewModel, activity: Activity, onBack: () -> U
 
     if (initDialog) {
         AlertDialog(
-            onDismissRequest = { initDialog = false },
+            onDismissRequest = closeInitDialog,
             confirmButton = {
                 Button(onClick = {
                     when {
@@ -637,10 +779,10 @@ private fun ProfileScreen(vm: MainViewModel, activity: Activity, onBack: () -> U
                             vm.message.value = if (it) "加密已开启" else "加密初始化失败"
                         }
                     }
-                    initDialog = false
+                    closeInitDialog()
                 }) { Text("确认") }
             },
-            dismissButton = { TextButton(onClick = { initDialog = false }) { Text("取消") } },
+            dismissButton = { TextButton(onClick = closeInitDialog) { Text("取消") } },
             title = { Text("设置解锁密码") },
             text = {
                 Column {
@@ -653,7 +795,7 @@ private fun ProfileScreen(vm: MainViewModel, activity: Activity, onBack: () -> U
 
     if (pwdDialog) {
         AlertDialog(
-            onDismissRequest = { pwdDialog = false },
+            onDismissRequest = closePwdDialog,
             confirmButton = {
                 Button(onClick = {
                     if (newPwd.length !in 6..16 || newPwd != newPwd2) {
@@ -663,10 +805,10 @@ private fun ProfileScreen(vm: MainViewModel, activity: Activity, onBack: () -> U
                             vm.message.value = if (ok) "密码修改成功" else "密码错误，请重新输入"
                         }
                     }
-                    pwdDialog = false
+                    closePwdDialog()
                 }) { Text("确认") }
             },
-            dismissButton = { TextButton(onClick = { pwdDialog = false }) { Text("取消") } },
+            dismissButton = { TextButton(onClick = closePwdDialog) { Text("取消") } },
             title = { Text("修改密码") },
             text = {
                 Column {
@@ -723,4 +865,45 @@ private fun statusLabel(status: TaskStatus): String = when (status) {
     TaskStatus.InProgress -> "进行中"
     TaskStatus.Completed -> "已完成"
     TaskStatus.Overdue -> "已逾期"
+}
+
+private const val TASKGAME_PREFS = "taskgame_local_prefs"
+private const val KEY_BG_POPUP_PROMPT_SHOWN = "bg_popup_prompt_shown"
+
+private fun shouldShowBackgroundPopupPrompt(context: Context): Boolean {
+    val prefs = context.getSharedPreferences(TASKGAME_PREFS, Context.MODE_PRIVATE)
+    return !prefs.getBoolean(KEY_BG_POPUP_PROMPT_SHOWN, false)
+}
+
+private fun markBackgroundPopupPromptShown(context: Context) {
+    val prefs: SharedPreferences = context.getSharedPreferences(TASKGAME_PREFS, Context.MODE_PRIVATE)
+    prefs.edit { putBoolean(KEY_BG_POPUP_PROMPT_SHOWN, true) }
+}
+
+private fun openBackgroundPopupSettings(context: Context) {
+    val intents = listOf(
+        Intent().apply {
+            setClassName(
+                "com.coloros.safecenter",
+                "com.coloros.safecenter.permission.PermissionAppAllPermissionActivity"
+            )
+            putExtra("packageName", context.packageName)
+        },
+        Intent().apply {
+            setClassName(
+                "com.oplus.safecenter",
+                "com.oplus.safecenter.permission.PermissionAppAllPermissionActivity"
+            )
+            putExtra("packageName", context.packageName)
+        },
+        Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+            data = "package:${context.packageName}".toUri()
+        }
+    )
+    intents.firstOrNull { intent ->
+        runCatching {
+            context.startActivity(intent)
+            true
+        }.getOrDefault(false)
+    }
 }

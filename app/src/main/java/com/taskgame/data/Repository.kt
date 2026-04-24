@@ -23,7 +23,10 @@ data class DashboardState(
     val tasks: List<TaskUiModel> = emptyList()
 )
 
-class TaskGameRepository private constructor(private val dao: TaskGameDao) {
+class TaskGameRepository private constructor(
+    private val appContext: Context,
+    private val dao: TaskGameDao
+) {
     val dashboardFlow: Flow<DashboardState> =
         combine(dao.observeSettings(), dao.observeTasks()) { settings, tasks ->
             val validSettings = settings ?: AppSettingsEntity()
@@ -45,6 +48,7 @@ class TaskGameRepository private constructor(private val dao: TaskGameDao) {
             dao.upsertSettings(AppSettingsEntity())
         }
         refreshOverdueAndScore()
+        rescheduleAllTaskReminders()
     }
 
     suspend fun saveUsername(username: String) {
@@ -109,20 +113,28 @@ class TaskGameRepository private constructor(private val dao: TaskGameDao) {
         if (subTasks.isNotEmpty()) {
             dao.insertSubTasks(subTasks.filter { it.isNotBlank() }.map { SubTaskEntity(taskId = id, name = it.trim()) })
         }
+        dao.getTask(id)?.let { com.taskgame.TaskNotificationScheduler.scheduleForTask(appContext, it) }
     }
 
-    suspend fun startTask(taskId: Long) = dao.updateTaskStatus(taskId, TaskStatus.InProgress)
+    suspend fun startTask(taskId: Long) {
+        dao.updateTaskStatus(taskId, TaskStatus.InProgress)
+        dao.getTask(taskId)?.let { com.taskgame.TaskNotificationScheduler.scheduleForTask(appContext, it) }
+    }
 
     suspend fun completeTask(taskId: Long) {
         val task = dao.getTask(taskId) ?: return
         if (task.status != TaskStatus.InProgress) return
         dao.updateTaskStatus(taskId, TaskStatus.Completed)
+        com.taskgame.TaskNotificationScheduler.cancelTask(appContext, taskId)
         val settings = dao.getSettings() ?: AppSettingsEntity()
         val score = settings.score + task.difficulty.reward
         dao.upsertSettings(settings.copy(score = score))
     }
 
-    suspend fun deleteTask(taskId: Long) = dao.deleteTask(taskId)
+    suspend fun deleteTask(taskId: Long) {
+        com.taskgame.TaskNotificationScheduler.cancelTask(appContext, taskId)
+        dao.deleteTask(taskId)
+    }
 
     suspend fun completeSubTask(subTaskId: Long) = dao.completeSubTask(subTaskId)
 
@@ -139,6 +151,7 @@ class TaskGameRepository private constructor(private val dao: TaskGameDao) {
                 } else {
                     dao.updateTaskStatus(task.id, TaskStatus.Overdue)
                 }
+                com.taskgame.TaskNotificationScheduler.cancelTask(appContext, task.id)
             }
         }
         if (score != settings.score) {
@@ -157,8 +170,17 @@ class TaskGameRepository private constructor(private val dao: TaskGameDao) {
         if (settings.score < cost) return Result.failure(IllegalStateException("积分不足，无法复活"))
         val newDeadline = currentMinuteMillis() + nDays * 24L * 60L * 60L * 1000L
         dao.reviveTask(taskId, newDeadline)
+        dao.updateNotified1h(taskId, false)
+        dao.updateNotified15m(taskId, false)
+        dao.getTask(taskId)?.let { com.taskgame.TaskNotificationScheduler.scheduleForTask(appContext, it) }
         dao.upsertSettings(settings.copy(score = settings.score - cost))
         return Result.success(Unit)
+    }
+
+    private suspend fun rescheduleAllTaskReminders() {
+        dao.getActiveTasks().forEach {
+            com.taskgame.TaskNotificationScheduler.scheduleForTask(appContext, it)
+        }
     }
 
     companion object {
@@ -167,7 +189,10 @@ class TaskGameRepository private constructor(private val dao: TaskGameDao) {
 
         fun getInstance(context: Context): TaskGameRepository {
             return instance ?: synchronized(this) {
-                instance ?: TaskGameRepository(buildDb(context).dao()).also { instance = it }
+                instance ?: TaskGameRepository(
+                    context.applicationContext,
+                    buildDb(context).dao()
+                ).also { instance = it }
             }
         }
 

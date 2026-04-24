@@ -47,7 +47,9 @@ data class TaskEntity(
     val status: TaskStatus,
     val description: String = "",
     val createdAtMillis: Long = System.currentTimeMillis(),
-    val overduePenaltyApplied: Boolean = false
+    val overduePenaltyApplied: Boolean = false,
+    val notified1h: Boolean = false,
+    val notified15m: Boolean = false
 )
 
 @Entity(
@@ -100,6 +102,12 @@ interface TaskGameDao {
     @Query("UPDATE tasks SET status = :status WHERE id = :taskId")
     suspend fun updateTaskStatus(taskId: Long, status: TaskStatus)
 
+    @Query("UPDATE tasks SET notified1h = :sent WHERE id = :taskId")
+    suspend fun updateNotified1h(taskId: Long, sent: Boolean = true)
+
+    @Query("UPDATE tasks SET notified15m = :sent WHERE id = :taskId")
+    suspend fun updateNotified15m(taskId: Long, sent: Boolean = true)
+
     @Query("UPDATE subtasks SET completed = 1 WHERE id = :subTaskId")
     suspend fun completeSubTask(subTaskId: Long)
 
@@ -128,7 +136,7 @@ interface TaskGameDao {
 
 @Database(
     entities = [AppSettingsEntity::class, TaskEntity::class, SubTaskEntity::class],
-    version = 2,
+    version = 3,
     exportSchema = false
 )
 abstract class TaskGameDatabase : RoomDatabase() {
